@@ -4,53 +4,37 @@ from datetime import datetime, timezone
 import json
 import time
 import os
+import uuid
 
 from mangaplus import MangaPlus
 from mangaplus.constants import Language, Viewer
 
+APP_VERSION = 237
 CACHE_TTL = 600
+
 CACHE = {
-    "time": 0,
-    "items": []
+    "updates": {}
 }
+
+LANG_MAP = {
+    "en": "ENGLISH",
+    "id": "INDONESIAN",
+    "es": "SPANISH",
+    "fr": "FRENCH",
+    "pt": "PORTUGUESE_BR",
+    "pt-br": "PORTUGUESE_BR",
+    "ru": "RUSSIAN",
+    "th": "THAI",
+    "vi": "VIETNAMESE",
+    "de": "GERMAN",
+}
+
 
 def get_lang(code):
     code = (code or "en").lower()
-
-    mapping = {
-        "en": "ENGLISH",
-        "id": "INDONESIAN",
-        "es": "SPANISH",
-        "fr": "FRENCH",
-        "pt": "PORTUGUESE_BR",
-        "pt-br": "PORTUGUESE_BR",
-        "ru": "RUSSIAN",
-        "th": "THAI",
-        "vi": "VIETNAMESE",
-        "de": "GERMAN",
-    }
-
-    name = mapping.get(code, "ENGLISH")
+    name = LANG_MAP.get(code, "ENGLISH")
     return getattr(Language, name, Language.ENGLISH)
 
-def get_val(data, keys, default=None):
-    if not isinstance(data, dict):
-        return default
-
-    for key in keys:
-        if key in data and data[key] not in [None, ""]:
-            return data[key]
-
-    return default
-
-def walk(node):
-    if isinstance(node, dict):
-        yield node
-        for value in node.values():
-            yield from walk(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield from walk(item)
 
 def to_iso(ts):
     if not ts:
@@ -72,9 +56,11 @@ def normalize_updates(raw):
     def val(data, keys, default=None):
         if not isinstance(data, dict):
             return default
+
         for key in keys:
             if key in data and data[key] not in [None, "", [], {}]:
                 return data[key]
+
         return default
 
     def title_info(obj):
@@ -89,7 +75,7 @@ def normalize_updates(raw):
             "titleImageUrl",
             "thumbnailUrl",
             "landscapeImageUrl",
-            "backgroundImageUrl"
+            "backgroundImageUrl",
         ])
 
         if title_id or name or cover:
@@ -114,32 +100,32 @@ def normalize_updates(raw):
             "name",
             "chapterName",
             "title",
-            "chapterTitle"
+            "chapterTitle",
         ])
 
         subtitle = val(obj, [
             "subTitle",
             "subtitle",
             "chapterSubTitle",
-            "chapterSubtitle"
+            "chapterSubtitle",
         ])
 
         thumbnail = val(obj, [
             "thumbnailUrl",
             "thumbnailURL",
-            "chapterImageUrl"
+            "chapterImageUrl",
         ])
 
         start_ts = val(obj, [
             "startTimeStamp",
             "startTimestamp",
             "releaseStartTimeStamp",
-            "updateTimeStamp"
+            "updateTimeStamp",
         ])
 
         end_ts = val(obj, [
             "endTimeStamp",
-            "endTimestamp"
+            "endTimestamp",
         ])
 
         t = ctx_title or {}
@@ -163,12 +149,10 @@ def normalize_updates(raw):
         if isinstance(node, dict):
             local_title = ctx_title
 
-            # Kalau object ini sendiri adalah data title
             own_title = title_info(node)
             if own_title and own_title.get("title_id"):
                 local_title = own_title
 
-            # Kalau title ada sebagai child/sibling di object yang sama
             for key in [
                 "title",
                 "titleView",
@@ -176,7 +160,7 @@ def normalize_updates(raw):
                 "titleDetailView",
                 "titleInfo",
                 "titleData",
-                "mangaTitle"
+                "mangaTitle",
             ]:
                 child = node.get(key)
                 if isinstance(child, dict):
@@ -184,12 +168,13 @@ def normalize_updates(raw):
                     if child_title:
                         local_title = child_title
 
-            ch = chapter_info(node, local_title)
-            if ch:
-                key = f"{ch.get('title_id')}:{ch.get('chapter_id')}"
-                if key not in seen:
-                    seen.add(key)
-                    items.append(ch)
+            chapter = chapter_info(node, local_title)
+
+            if chapter:
+                unique_key = f"{chapter.get('title_id')}:{chapter.get('chapter_id')}"
+                if unique_key not in seen:
+                    seen.add(unique_key)
+                    items.append(chapter)
 
             for value in node.values():
                 scan(value, local_title)
@@ -200,94 +185,124 @@ def normalize_updates(raw):
 
     scan(raw)
 
-    # Prioritaskan yang punya title, biar data kosong tidak muncul di atas
+    items = [item for item in items if item.get("chapter_id")]
+
     items.sort(
         key=lambda x: (
             0 if x.get("title") else 1,
-            x.get("published_at") or "",
-            str(x.get("chapter_id") or "")
-        ),
-        reverse=False
+            str(x.get("title") or ""),
+            str(x.get("chapter_id") or ""),
+        )
     )
 
     return items
 
+
 def fetch_updates(lang_code="en", force=False):
+    lang_code = (lang_code or "en").lower()
     now = time.time()
 
-    if not force and CACHE["items"] and now - CACHE["time"] < CACHE_TTL:
-        return CACHE["items"]
+    cached = CACHE["updates"].get(lang_code)
+
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["items"]
 
     selected_lang = get_lang(lang_code)
 
     client = MangaPlus(
         lang=selected_lang,
         clang=[selected_lang],
-        viewer=Viewer.VERTICAL
+        viewer=Viewer.VERTICAL,
     )
 
-    # Versi yang berhasil dari test kamu
-    client.APP_VERSION = 237
+    client.APP_VERSION = APP_VERSION
+    client.register(device_id=str(uuid.uuid4()))
 
-    # Wajib register device dulu
-    import uuid
-    device_id = str(uuid.uuid4())
-    client.register(device_id=device_id)
-
-    # getUpdates/home_v4 error, pakai home_v6
     raw = client.getHome()
-
     items = normalize_updates(raw)
 
-    CACHE["time"] = now
-    CACHE["items"] = items
+    CACHE["updates"][lang_code] = {
+        "time": now,
+        "items": items,
+    }
 
     return items
 
+
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        print("%s - %s" % (self.address_string(), format % args))
+
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
 
         lang = qs.get("lang", ["en"])[0]
-        limit = int(qs.get("limit", ["30"])[0])
-        force = qs.get("force", ["0"])[0] in ["1", "true", "yes"]
+
+        try:
+            limit = int(qs.get("limit", ["30"])[0])
+        except Exception:
+            limit = 30
+
+        try:
+            page = int(qs.get("page", ["1"])[0])
+        except Exception:
+            page = 1
+
+        limit = max(1, min(limit, 100))
+        page = max(1, page)
+
+        force = qs.get("force", ["0"])[0].lower() in ["1", "true", "yes"]
 
         try:
             if path == "/":
                 return self.send_json({
                     "ok": True,
                     "message": "MangaPlus API aktif",
-                    "endpoints": [
-                        "/api/updates?lang=en&limit=30",
-                        "/api/updates?lang=id&limit=30"
-                    ]
+                    "source": "MANGA Plus by SHUEISHA",
+                    "endpoints": {
+                        "health": "/health",
+                        "updates": "/api/updates?lang=id&limit=20",
+                        "updates_page": "/api/updates?lang=id&page=1&limit=20",
+                        "search": "/api/updates?lang=id&q=bug",
+                        "title": "/api/title/100294?lang=id",
+                        "cache_clear": "/api/cache/clear",
+                    }
                 })
 
             if path == "/health":
                 return self.send_json({
                     "ok": True,
                     "status": "healthy",
-                    "service": "MangaPlus Updates API"
+                    "service": "MangaPlus Updates API",
+                    "app_version": APP_VERSION,
                 })
 
             if path == "/api/cache/clear":
-                CACHE["time"] = 0
-                CACHE["items"] = []
+                CACHE["updates"] = {}
                 return self.send_json({
                     "ok": True,
-                    "message": "Cache berhasil dibersihkan"
+                    "message": "Cache berhasil dibersihkan",
                 })
 
             if path.startswith("/api/title/"):
@@ -303,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({
                         "ok": False,
                         "message": "Title tidak ditemukan",
-                        "title_id": title_id
+                        "title_id": title_id,
                     }, status=404)
 
                 first = title_items[0]
@@ -317,14 +332,13 @@ class Handler(BaseHTTPRequestHandler):
                     "author": first.get("author"),
                     "cover": first.get("cover"),
                     "title_url": first.get("title_url"),
-                    "chapters": title_items
+                    "chapters": title_items,
                 })
 
             if path == "/api/updates":
                 items = fetch_updates(lang_code=lang, force=force)
 
                 q = qs.get("q", [""])[0].strip().lower()
-                page = int(qs.get("page", ["1"])[0])
 
                 if q:
                     items = [
@@ -354,18 +368,19 @@ class Handler(BaseHTTPRequestHandler):
 
             return self.send_json({
                 "ok": False,
-                "message": "Endpoint tidak ditemukan"
+                "message": "Endpoint tidak ditemukan",
+                "path": path,
             }, status=404)
 
         except Exception as e:
             return self.send_json({
                 "ok": False,
-                "error": str(e)
+                "error": str(e),
             }, status=500)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Server jalan di http://0.0.0.0:{port}")
     server.serve_forever()
-
