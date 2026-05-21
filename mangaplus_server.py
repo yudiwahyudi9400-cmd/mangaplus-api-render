@@ -7,7 +7,7 @@ import os
 import uuid
 
 from mangaplus import MangaPlus
-from mangaplus.constants import Language, Viewer, Quality
+from mangaplus.constants import Language, Viewer, Quality, Ranking, TitleType
 
 APP_VERSION = 237
 CACHE_TTL = 600
@@ -383,6 +383,321 @@ def fetch_chapter(chapter_id, lang_code="id", quality_code="super_high", force=F
 
     return data
 
+
+# =========================
+# EXTRA NORMALIZED ENDPOINTS
+# =========================
+
+PUBLIC_LANGUAGES = [
+    {"code": "en", "api_code": "eng", "name": "English"},
+    {"code": "id", "api_code": "ind", "name": "Indonesian"},
+    {"code": "es", "api_code": "esp", "name": "Spanish"},
+    {"code": "fr", "api_code": "fra", "name": "French"},
+    {"code": "pt-br", "api_code": "ptb", "name": "Portuguese BR"},
+    {"code": "ru", "api_code": "rus", "name": "Russian"},
+    {"code": "th", "api_code": "tha", "name": "Thai"},
+    {"code": "vi", "api_code": "vie", "name": "Vietnamese"},
+    {"code": "de", "api_code": "deu", "name": "German"},
+]
+
+TITLE_TYPE_MAP = {
+    "serializing": TitleType.SERIALIZING,
+    "ongoing": TitleType.SERIALIZING,
+    "completed": TitleType.COMPLETED,
+    "complete": TitleType.COMPLETED,
+    "one-shot": TitleType.ONE_SHOT,
+    "oneshot": TitleType.ONE_SHOT,
+    "one_shot": TitleType.ONE_SHOT,
+}
+
+RANKING_MAP = {
+    "hottest": Ranking.HOTTEST,
+    "hot": Ranking.HOTTEST,
+    "trending": Ranking.TRENDING,
+    "trend": Ranking.TRENDING,
+    "completed": Ranking.COMPLETED,
+    "complete": Ranking.COMPLETED,
+}
+
+def make_client(lang_code="id"):
+    selected_lang = get_lang(lang_code)
+    client = MangaPlus(
+        lang=selected_lang,
+        clang=[selected_lang],
+        viewer=Viewer.VERTICAL
+    )
+    client.APP_VERSION = APP_VERSION
+    client.register(device_id=str(uuid.uuid4()))
+    return client
+
+def pick(data, keys, default=None):
+    if not isinstance(data, dict):
+        return default
+    for key in keys:
+        if key in data and data[key] not in [None, "", [], {}]:
+            return data[key]
+    return default
+
+def iter_dicts(node):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from iter_dicts(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from iter_dicts(item)
+
+def normalize_title_items(raw):
+    items = []
+    seen = set()
+
+    for obj in iter_dicts(raw):
+        title_id = pick(obj, ["titleId", "titleID"])
+        name = pick(obj, ["name", "titleName", "englishName"])
+        author = pick(obj, ["author", "authorName"])
+        description = pick(obj, ["description", "overview", "synopsis"])
+        cover = pick(obj, [
+            "portraitImageUrl",
+            "titleImageUrl",
+            "thumbnailUrl",
+            "landscapeImageUrl",
+            "backgroundImageUrl",
+        ])
+        banner = pick(obj, [
+            "backgroundImageUrl",
+            "landscapeImageUrl",
+            "bannerImageUrl",
+        ])
+
+        if not title_id:
+            continue
+
+        key = str(title_id)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        items.append({
+            "title_id": title_id,
+            "title": name,
+            "author": author,
+            "description": description,
+            "cover": cover,
+            "thumbnail": cover,
+            "banner": banner or cover,
+            "title_url": f"https://mangaplus.shueisha.co.jp/titles/{title_id}",
+            "detail_api": f"/api/detail/{title_id}",
+        })
+
+    return items
+
+def normalize_creators(items):
+    creators = {}
+    for item in items:
+        author = item.get("author")
+        if not author:
+            continue
+
+        if author not in creators:
+            creators[author] = {
+                "name": author,
+                "total_titles": 0,
+                "titles": []
+            }
+
+        creators[author]["total_titles"] += 1
+        creators[author]["titles"].append({
+            "title_id": item.get("title_id"),
+            "title": item.get("title"),
+            "cover": item.get("cover"),
+            "detail_api": item.get("detail_api"),
+        })
+
+    return sorted(creators.values(), key=lambda x: x["name"].lower())
+
+def paginate_items(items, page=1, limit=30):
+    page = max(1, int(page))
+    limit = max(1, min(int(limit), 100))
+    total = len(items)
+    start = (page - 1) * limit
+    end = start + limit
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": (total + limit - 1) // limit,
+        "count": len(items[start:end]),
+        "items": items[start:end],
+    }
+
+def fetch_home_data(lang_code="id", force=False):
+    cache_key = f"home:{lang_code}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    client = make_client(lang_code)
+    raw = client.getHome()
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "raw_keys": list(raw.keys()) if isinstance(raw, dict) else [],
+        "featured": normalize_title_items(raw),
+        "updates": normalize_updates(raw),
+        "raw": raw,
+    }
+
+    CHAPTER_CACHE[cache_key] = {"time": now, "data": data}
+    return data
+
+def fetch_all_titles_data(lang_code="id", title_type="serializing", force=False):
+    title_type = (title_type or "serializing").lower()
+    enum_type = TITLE_TYPE_MAP.get(title_type, TitleType.SERIALIZING)
+
+    cache_key = f"titles:{lang_code}:{title_type}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    client = make_client(lang_code)
+    raw = client.getAllTitlesV3(title_type=enum_type)
+    items = normalize_title_items(raw)
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "type": title_type,
+        "items": items,
+        "raw": raw,
+    }
+
+    CHAPTER_CACHE[cache_key] = {"time": now, "data": data}
+    return data
+
+def fetch_ranking_data(lang_code="id", ranking_type="hottest", force=False):
+    ranking_type = (ranking_type or "hottest").lower()
+    enum_type = RANKING_MAP.get(ranking_type, Ranking.HOTTEST)
+
+    cache_key = f"ranking:{lang_code}:{ranking_type}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    client = make_client(lang_code)
+    raw = client.getRankingV2(ranking=enum_type)
+    items = normalize_title_items(raw)
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "type": ranking_type,
+        "items": items,
+        "raw": raw,
+    }
+
+    CHAPTER_CACHE[cache_key] = {"time": now, "data": data}
+    return data
+
+def fetch_search_data(lang_code="id", q="", force=False):
+    q = (q or "").strip().lower()
+
+    cache_key = f"search-base:{lang_code}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        all_items = cached["items"]
+    else:
+        client = make_client(lang_code)
+        raw = client.getSearchTitles()
+        all_items = normalize_title_items(raw)
+
+        # fallback kalau search endpoint kosong
+        if not all_items:
+            all_items = []
+            for t in ["serializing", "completed", "one-shot"]:
+                all_items.extend(fetch_all_titles_data(lang_code, t, force=True)["items"])
+
+        # dedupe
+        clean = []
+        seen = set()
+        for item in all_items:
+            key = str(item.get("title_id"))
+            if key not in seen:
+                seen.add(key)
+                clean.append(item)
+        all_items = clean
+
+        CHAPTER_CACHE[cache_key] = {"time": now, "items": all_items}
+
+    if q:
+        all_items = [
+            item for item in all_items
+            if q in str(item.get("title") or "").lower()
+            or q in str(item.get("author") or "").lower()
+            or q in str(item.get("description") or "").lower()
+        ]
+
+    return all_items
+
+def build_schedule_from_updates(updates):
+    groups = {}
+
+    for item in updates:
+        published = item.get("published_at")
+        key = "unknown"
+
+        if published:
+            key = published[:10]
+
+        if key not in groups:
+            groups[key] = []
+
+        groups[key].append(item)
+
+    result = []
+    for date_key, items in groups.items():
+        result.append({
+            "date": date_key,
+            "count": len(items),
+            "items": items,
+        })
+
+    return result
+
+def fetch_settings_data(lang_code="id", force=False):
+    cache_key = f"settings:{lang_code}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    client = make_client(lang_code)
+    raw = client.getSettings()
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "languages": PUBLIC_LANGUAGES,
+        "raw": raw,
+    }
+
+    CHAPTER_CACHE[cache_key] = {"time": now, "data": data}
+    return data
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print("%s - %s" % (self.address_string(), format % args))
@@ -436,6 +751,7 @@ class Handler(BaseHTTPRequestHandler):
                     "source": "MANGA Plus by SHUEISHA",
                     "endpoints": {
                         "health": "/health",
+                        "all_endpoints": "/api/endpoints",
                         "updates": "/api/updates?lang=id&limit=20",
                         "updates_page": "/api/updates?lang=id&page=1&limit=20",
                         "search": "/api/updates?lang=id&q=bug",
@@ -451,6 +767,219 @@ class Handler(BaseHTTPRequestHandler):
                     "service": "MangaPlus Updates API",
                     "app_version": APP_VERSION,
                 })
+
+
+            if path == "/api/endpoints":
+                return self.send_json({
+                    "ok": True,
+                    "base_url": "https://mangaplus-api.onrender.com",
+                    "endpoints": {
+                        "home": "/api/home?lang=id",
+                        "updates": "/api/updates?lang=id&page=1&limit=20",
+                        "featured": "/api/featured?lang=id",
+                        "ranking": "/api/ranking?lang=id&type=hottest",
+                        "ranking_trending": "/api/ranking?lang=id&type=trending",
+                        "ranking_completed": "/api/ranking?lang=id&type=completed",
+                        "titles_serializing": "/api/titles?lang=id&type=serializing&page=1&limit=30",
+                        "titles_completed": "/api/titles?lang=id&type=completed&page=1&limit=30",
+                        "titles_one_shot": "/api/titles?lang=id&type=one-shot&page=1&limit=30",
+                        "search": "/api/search?lang=id&q=one",
+                        "creators": "/api/creators?lang=id",
+                        "languages": "/api/languages",
+                        "settings": "/api/settings?lang=id",
+                        "schedule": "/api/schedule?lang=id",
+                        "detail": "/api/detail/100294?lang=id",
+                        "chapter": "/api/chapter/1026318?lang=id&quality=super_high",
+                        "raw_home": "/api/raw/home?lang=id",
+                        "raw_settings": "/api/raw/settings?lang=id",
+                    }
+                })
+
+            if path == "/api/languages":
+                return self.send_json({
+                    "ok": True,
+                    "count": len(PUBLIC_LANGUAGES),
+                    "languages": PUBLIC_LANGUAGES,
+                })
+
+            if path == "/api/settings":
+                data = fetch_settings_data(lang_code=lang, force=force)
+                raw = qs.get("raw", ["0"])[0].lower() in ["1", "true", "yes"]
+                if not raw:
+                    data = {k: v for k, v in data.items() if k != "raw"}
+                return self.send_json(data)
+
+            if path == "/api/home":
+                data = fetch_home_data(lang_code=lang, force=force)
+                raw = qs.get("raw", ["0"])[0].lower() in ["1", "true", "yes"]
+                if not raw:
+                    data = {k: v for k, v in data.items() if k != "raw"}
+                return self.send_json(data)
+
+            if path in ["/api/featured", "/api/unggulan"]:
+                data = fetch_home_data(lang_code=lang, force=force)
+                items = data.get("featured", [])
+
+                q = qs.get("q", [""])[0].strip().lower()
+                if q:
+                    items = [
+                        item for item in items
+                        if q in str(item.get("title") or "").lower()
+                        or q in str(item.get("author") or "").lower()
+                    ]
+
+                page_data = paginate_items(items, page=page, limit=limit)
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    "section": "featured",
+                    **page_data,
+                })
+
+            if path == "/api/ranking":
+                ranking_type = qs.get("type", ["hottest"])[0]
+                data = fetch_ranking_data(lang_code=lang, ranking_type=ranking_type, force=force)
+                items = data.get("items", [])
+
+                q = qs.get("q", [""])[0].strip().lower()
+                if q:
+                    items = [
+                        item for item in items
+                        if q in str(item.get("title") or "").lower()
+                        or q in str(item.get("author") or "").lower()
+                    ]
+
+                page_data = paginate_items(items, page=page, limit=limit)
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    "type": ranking_type,
+                    **page_data,
+                })
+
+            if path in ["/api/titles", "/api/manga", "/api/daftar-manga"]:
+                title_type = qs.get("type", ["serializing"])[0]
+                data = fetch_all_titles_data(lang_code=lang, title_type=title_type, force=force)
+                items = data.get("items", [])
+
+                q = qs.get("q", [""])[0].strip().lower()
+                if q:
+                    items = [
+                        item for item in items
+                        if q in str(item.get("title") or "").lower()
+                        or q in str(item.get("author") or "").lower()
+                        or q in str(item.get("description") or "").lower()
+                    ]
+
+                page_data = paginate_items(items, page=page, limit=limit)
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    "type": title_type,
+                    **page_data,
+                })
+
+            if path == "/api/search":
+                q = qs.get("q", [""])[0]
+                items = fetch_search_data(lang_code=lang, q=q, force=force)
+                page_data = paginate_items(items, page=page, limit=limit)
+
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    "q": q,
+                    **page_data,
+                })
+
+            if path in ["/api/creators", "/api/kreator"]:
+                # Ambil kreator dari semua daftar title
+                all_items = []
+                for t in ["serializing", "completed", "one-shot"]:
+                    all_items.extend(fetch_all_titles_data(lang_code=lang, title_type=t, force=force)["items"])
+
+                # Dedupe title
+                clean = []
+                seen = set()
+                for item in all_items:
+                    key = str(item.get("title_id"))
+                    if key not in seen:
+                        seen.add(key)
+                        clean.append(item)
+
+                creators = normalize_creators(clean)
+
+                q = qs.get("q", [""])[0].strip().lower()
+                if q:
+                    creators = [
+                        c for c in creators
+                        if q in c["name"].lower()
+                    ]
+
+                page_data = paginate_items(creators, page=page, limit=limit)
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    **page_data,
+                })
+
+            if path in ["/api/schedule", "/api/jadwal"]:
+                updates = fetch_updates(lang_code=lang, force=force)
+                schedule = build_schedule_from_updates(updates)
+
+                return self.send_json({
+                    "ok": True,
+                    "source": "MANGA Plus by SHUEISHA",
+                    "lang": lang,
+                    "note": "Schedule dibuat dari data update yang tersedia. Jika published_at null, item masuk ke grup unknown.",
+                    "count": len(schedule),
+                    "schedule": schedule,
+                })
+
+            if path == "/api/raw/home":
+                return self.send_json(fetch_home_data(lang_code=lang, force=force).get("raw"))
+
+            if path == "/api/raw/settings":
+                return self.send_json(fetch_settings_data(lang_code=lang, force=force).get("raw"))
+
+            if path == "/api/raw/search":
+                client = make_client(lang)
+                return self.send_json(client.getSearchTitles())
+
+            if path == "/api/raw/titles":
+                title_type = qs.get("type", ["serializing"])[0]
+                enum_type = TITLE_TYPE_MAP.get(title_type, TitleType.SERIALIZING)
+                client = make_client(lang)
+                return self.send_json(client.getAllTitlesV3(title_type=enum_type))
+
+            if path == "/api/raw/ranking":
+                ranking_type = qs.get("type", ["hottest"])[0]
+                enum_type = RANKING_MAP.get(ranking_type, Ranking.HOTTEST)
+                client = make_client(lang)
+                return self.send_json(client.getRankingV2(ranking=enum_type))
+
+            if path.startswith("/api/raw/detail/"):
+                title_id = path.replace("/api/raw/detail/", "").strip()
+                if not title_id.isdigit():
+                    return self.send_json({"ok": False, "message": "title_id tidak valid"}, status=400)
+                client = make_client(lang)
+                return self.send_json(client.getTitleDetail(title_id=int(title_id)))
+
+            if path.startswith("/api/raw/chapter/"):
+                chapter_id = path.replace("/api/raw/chapter/", "").strip()
+                quality = qs.get("quality", ["super_high"])[0]
+                if not chapter_id.isdigit():
+                    return self.send_json({"ok": False, "message": "chapter_id tidak valid"}, status=400)
+                client = make_client(lang)
+                return self.send_json(client.getMangaData(
+                    chapter_id=int(chapter_id),
+                    split=True,
+                    quality=get_quality(quality)
+                ))
 
             if path == "/api/cache/clear":
                 CACHE["updates"] = {}
