@@ -698,6 +698,175 @@ def fetch_settings_data(lang_code="id", force=False):
     CHAPTER_CACHE[cache_key] = {"time": now, "data": data}
     return data
 
+
+# =========================
+# DETAIL MANGA ENDPOINT
+# =========================
+
+def normalize_title_detail_full(raw, title_id):
+    detail = {
+        "title_id": int(title_id),
+        "title": None,
+        "author": None,
+        "description": None,
+        "cover": None,
+        "thumbnail": None,
+        "banner": None,
+        "chapters": [],
+    }
+
+    seen_chapters = set()
+
+    def val(data, keys, default=None):
+        if not isinstance(data, dict):
+            return default
+        for key in keys:
+            if key in data and data[key] not in [None, "", [], {}]:
+                return data[key]
+        return default
+
+    def scan(node):
+        if isinstance(node, dict):
+            maybe_title_id = val(node, ["titleId", "titleID"])
+            maybe_title = val(node, ["name", "titleName", "englishName"])
+            maybe_author = val(node, ["author", "authorName"])
+            maybe_desc = val(node, ["description", "overview", "synopsis"])
+
+            maybe_cover = val(node, [
+                "portraitImageUrl",
+                "titleImageUrl",
+                "thumbnailUrl",
+                "landscapeImageUrl",
+                "backgroundImageUrl",
+            ])
+
+            maybe_banner = val(node, [
+                "backgroundImageUrl",
+                "landscapeImageUrl",
+                "bannerImageUrl",
+            ])
+
+            if maybe_title_id or maybe_title or maybe_cover:
+                if maybe_title and not detail["title"]:
+                    detail["title"] = maybe_title
+
+                if maybe_author and not detail["author"]:
+                    detail["author"] = maybe_author
+
+                if maybe_desc and not detail["description"]:
+                    detail["description"] = maybe_desc
+
+                if maybe_cover and not detail["cover"]:
+                    detail["cover"] = maybe_cover
+                    detail["thumbnail"] = maybe_cover
+
+                if maybe_banner and not detail["banner"]:
+                    detail["banner"] = maybe_banner
+
+            chapter_id = val(node, ["chapterId", "chapterID"])
+
+            if chapter_id and str(chapter_id) not in seen_chapters:
+                seen_chapters.add(str(chapter_id))
+
+                chapter_name = val(node, [
+                    "name",
+                    "chapterName",
+                    "title",
+                    "chapterTitle",
+                ])
+
+                subtitle = val(node, [
+                    "subTitle",
+                    "subtitle",
+                    "chapterSubTitle",
+                    "chapterSubtitle",
+                ])
+
+                thumbnail = val(node, [
+                    "thumbnailUrl",
+                    "thumbnailURL",
+                    "chapterImageUrl",
+                ])
+
+                start_ts = val(node, [
+                    "startTimeStamp",
+                    "startTimestamp",
+                    "releaseStartTimeStamp",
+                    "updateTimeStamp",
+                ])
+
+                end_ts = val(node, [
+                    "endTimeStamp",
+                    "endTimestamp",
+                ])
+
+                detail["chapters"].append({
+                    "chapter_id": chapter_id,
+                    "chapter": chapter_name,
+                    "subtitle": subtitle,
+                    "thumbnail": thumbnail or detail.get("cover"),
+                    "published_at": to_iso(start_ts),
+                    "expired_at": to_iso(end_ts),
+                    "reader_api": f"/api/chapter/{chapter_id}",
+                    "reader_url": f"https://mangaplus.shueisha.co.jp/viewer/{chapter_id}",
+                })
+
+            for value in node.values():
+                scan(value)
+
+        elif isinstance(node, list):
+            for item in node:
+                scan(item)
+
+    scan(raw)
+
+    detail["chapters"].sort(
+        key=lambda x: int(x.get("chapter_id") or 0),
+        reverse=True
+    )
+
+    if not detail["banner"]:
+        detail["banner"] = detail["cover"]
+
+    return detail
+
+
+def fetch_title_detail_full(title_id, lang_code="id", force=False):
+    cache_key = f"full-detail:{lang_code}:{title_id}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    selected_lang = get_lang(lang_code)
+
+    client = MangaPlus(
+        lang=selected_lang,
+        clang=[selected_lang],
+        viewer=Viewer.VERTICAL
+    )
+
+    client.APP_VERSION = APP_VERSION
+    client.register(device_id=str(uuid.uuid4()))
+
+    raw = client.getTitleDetail(title_id=int(title_id))
+    detail = normalize_title_detail_full(raw, title_id)
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "detail": detail,
+    }
+
+    CHAPTER_CACHE[cache_key] = {
+        "time": now,
+        "data": data,
+    }
+
+    return data
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print("%s - %s" % (self.address_string(), format % args))
@@ -989,6 +1158,24 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Cache berhasil dibersihkan",
                 })
 
+
+
+            if path.startswith("/api/detail/"):
+                title_id = path.replace("/api/detail/", "").strip()
+
+                if not title_id.isdigit():
+                    return self.send_json({
+                        "ok": False,
+                        "message": "title_id tidak valid"
+                    }, status=400)
+
+                data = fetch_title_detail_full(
+                    title_id=title_id,
+                    lang_code=lang,
+                    force=force
+                )
+
+                return self.send_json(data)
 
             if path.startswith("/api/chapter/"):
                 chapter_id = path.replace("/api/chapter/", "").strip()
