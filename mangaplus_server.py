@@ -7,10 +7,11 @@ import os
 import uuid
 
 from mangaplus import MangaPlus
-from mangaplus.constants import Language, Viewer
+from mangaplus.constants import Language, Viewer, Quality
 
 APP_VERSION = 237
 CACHE_TTL = 600
+CHAPTER_CACHE = {}
 
 CACHE = {
     "updates": {}
@@ -229,6 +230,159 @@ def fetch_updates(lang_code="en", force=False):
     return items
 
 
+
+def get_quality(code):
+    code = (code or "super_high").lower().replace("-", "_")
+
+    mapping = {
+        "super_high": "SUPER_HIGH",
+        "high": "HIGH",
+        "low": "LOW",
+    }
+
+    name = mapping.get(code, "SUPER_HIGH")
+    return getattr(Quality, name, Quality.SUPER_HIGH)
+
+
+def extract_chapter_pages(raw):
+    pages = []
+    title = None
+    chapter = None
+
+    def val(data, keys, default=None):
+        if not isinstance(data, dict):
+            return default
+        for key in keys:
+            if key in data and data[key] not in [None, "", [], {}]:
+                return data[key]
+        return default
+
+    def scan_meta(node):
+        nonlocal title, chapter
+
+        if isinstance(node, dict):
+            if title is None:
+                title = val(node, ["titleName", "title", "name"])
+            if chapter is None:
+                chapter = val(node, ["chapterName", "chapterTitle", "subtitle", "subTitle"])
+
+            for v in node.values():
+                scan_meta(v)
+
+        elif isinstance(node, list):
+            for item in node:
+                scan_meta(item)
+
+    def scan_pages(node):
+        if isinstance(node, dict):
+            manga_page = node.get("mangaPage") or node.get("manga_page")
+
+            if isinstance(manga_page, dict):
+                image_url = val(manga_page, ["imageUrl", "imageURL", "url"])
+                width = val(manga_page, ["width"])
+                height = val(manga_page, ["height"])
+                encryption_key = val(manga_page, ["encryptionKey", "encryption_key"])
+
+                if image_url:
+                    pages.append({
+                        "index": len(pages) + 1,
+                        "image_url": image_url,
+                        "width": width,
+                        "height": height,
+                        "is_encrypted": bool(encryption_key),
+                    })
+
+            else:
+                image_url = val(node, ["imageUrl", "imageURL", "url"])
+
+                if image_url and str(image_url).startswith("http"):
+                    pages.append({
+                        "index": len(pages) + 1,
+                        "image_url": image_url,
+                        "width": val(node, ["width"]),
+                        "height": val(node, ["height"]),
+                        "is_encrypted": bool(val(node, ["encryptionKey", "encryption_key"])),
+                    })
+
+            for v in node.values():
+                scan_pages(v)
+
+        elif isinstance(node, list):
+            for item in node:
+                scan_pages(item)
+
+    scan_meta(raw)
+    scan_pages(raw)
+
+    # Hapus duplikat URL
+    clean = []
+    seen = set()
+
+    for page in pages:
+        url = page.get("image_url")
+        if url and url not in seen:
+            seen.add(url)
+            page["index"] = len(clean) + 1
+            clean.append(page)
+
+    return {
+        "title": title,
+        "chapter": chapter,
+        "pages": clean,
+        "page_count": len(clean),
+        "encrypted_pages": len([x for x in clean if x.get("is_encrypted")]),
+    }
+
+
+def fetch_chapter(chapter_id, lang_code="id", quality_code="super_high", force=False):
+    cache_key = f"{lang_code}:{chapter_id}:{quality_code}"
+    now = time.time()
+
+    cached = CHAPTER_CACHE.get(cache_key)
+    if not force and cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+
+    selected_lang = get_lang(lang_code)
+
+    client = MangaPlus(
+        lang=selected_lang,
+        clang=[selected_lang],
+        viewer=Viewer.VERTICAL
+    )
+
+    client.APP_VERSION = 237
+
+    import uuid
+    client.register(device_id=str(uuid.uuid4()))
+
+    raw = client.getMangaData(
+        chapter_id=int(chapter_id),
+        split=True,
+        quality=get_quality(quality_code)
+    )
+
+    parsed = extract_chapter_pages(raw)
+
+    data = {
+        "ok": True,
+        "source": "MANGA Plus by SHUEISHA",
+        "lang": lang_code,
+        "chapter_id": int(chapter_id),
+        "quality": quality_code,
+        "title": parsed.get("title"),
+        "chapter": parsed.get("chapter"),
+        "page_count": parsed.get("page_count"),
+        "encrypted_pages": parsed.get("encrypted_pages"),
+        "pages": parsed.get("pages"),
+    }
+
+    CHAPTER_CACHE[cache_key] = {
+        "time": now,
+        "data": data,
+    }
+
+    return data
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print("%s - %s" % (self.address_string(), format % args))
@@ -300,10 +454,31 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/cache/clear":
                 CACHE["updates"] = {}
+                CHAPTER_CACHE.clear()
                 return self.send_json({
                     "ok": True,
                     "message": "Cache berhasil dibersihkan",
                 })
+
+
+            if path.startswith("/api/chapter/"):
+                chapter_id = path.replace("/api/chapter/", "").strip()
+                quality = qs.get("quality", ["super_high"])[0]
+
+                if not chapter_id.isdigit():
+                    return self.send_json({
+                        "ok": False,
+                        "message": "chapter_id tidak valid"
+                    }, status=400)
+
+                data = fetch_chapter(
+                    chapter_id=chapter_id,
+                    lang_code=lang,
+                    quality_code=quality,
+                    force=force
+                )
+
+                return self.send_json(data)
 
             if path.startswith("/api/title/"):
                 title_id = path.replace("/api/title/", "").strip()
